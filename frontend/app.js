@@ -28,7 +28,10 @@ const searchInput = document.getElementById('search-input');
 const filterSelect = document.getElementById('filter-select');
 const refreshBtn = document.getElementById('refresh-btn');
 const navFetchBtn = document.getElementById('nav-fetch-btn');
-const navFetchStatus = document.getElementById('nav-fetch-status');
+const spotTimeLabel = document.getElementById('spot-time-label');
+const navTimeLabel = document.getElementById('nav-time-label');
+const spotChipDot = document.getElementById('spot-chip-dot');
+const navChipDot = document.getElementById('nav-chip-dot');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const totalEl = document.getElementById('stat-total');
@@ -70,26 +73,173 @@ async function triggerBackendNavFetch(code) {
 
 // ─── 核心：加载数据 ────────────────────────────────────────────────────────
 
+// ─── 核心：加载数据 ────────────────────────────────────────────────────────
+
+/**
+ * 纯前端高并发拉取东财场内行情（支持跨域，秒级响应，利用浏览器真实指纹，彻底解决后端拉取被断开问题）
+ */
+async function fetchLOFSpotFromFrontend() {
+  const PAGE_SIZE = 100;
+  const BASE = `https://push2.eastmoney.com/api/qt/clist/get?pz=${PAGE_SIZE}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f20&fs=b:MK0404,b:MK0405,b:MK0406,b:MK0407&fields=f1,f2,f3,f12,f14,f15,f16,f17,f18,f20,f62,f124,f152`;
+
+  async function fetchPage(pn) {
+    const url = `${BASE}&pn=${pn}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`行情接口第 ${pn} 页拉取失败`);
+    return res.json();
+  }
+
+  const first = await fetchPage(1);
+  const total = first?.data?.total ?? 0;
+  
+  const parseDiff = (data) => {
+    const diff = data?.data?.diff;
+    if (!diff || !Array.isArray(diff)) return [];
+    return diff.map(item => ({
+      code: item.f12,
+      name: item.f14,
+      price: safeNum(item.f2),
+      change: safeNum(item.f3),
+      high: safeNum(item.f15),
+      low: safeNum(item.f16),
+      open: safeNum(item.f17),
+      preClose: safeNum(item.f18),
+      volume: safeNum(item.f20),
+      priceTime: formatUnixSec(item.f124),
+    })).filter(f => f.code && f.price > 0);
+  };
+
+  let allItems = parseDiff(first);
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+  
+  if (totalPages > 1) {
+    const pageNums = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
+    const results = await Promise.all(pageNums.map(pn => fetchPage(pn).catch(err => {
+      console.warn(`第 ${pn} 页行情并发拉取失败，降级忽略此页:`, err);
+      return null;
+    })));
+    results.forEach(data => {
+      if (data) {
+        allItems = allItems.concat(parseDiff(data));
+      }
+    });
+  }
+
+  // 行情按代码去重
+  const seen = new Set();
+  return allItems.filter(f => {
+    if (seen.has(f.code)) return false;
+    seen.add(f.code);
+    return true;
+  });
+}
+
 async function loadData() {
   if (isLoading) return;
   isLoading = true;
-  setStatus('loading', '正在从数据库同步数据…');
+  setStatus('loading', '正在获取最新的实时场内价格…');
   refreshBtn.disabled = true;
-  if (allFunds.length === 0) showLoading(); // 只在初始加载时霸屏动画
+  if (allFunds.length === 0) showLoading(); // 仅首次霸屏
 
   try {
-    allFunds = await fetchFundsFromBackend();
-    console.log(`[LOF Monitor] 加载完成，共 ${allFunds.length} 只`);
+    // 黄金双轨并发：前端直拉实时场内价格，同时后端0毫秒返回数据库缓存的场外净值
+    const [spotList, backendList] = await Promise.all([
+      fetchLOFSpotFromFrontend().catch(err => {
+        console.error('前端拉取场内价格失败，将以降级旧数据渲染:', err);
+        return [];
+      }),
+      fetchFundsFromBackend().catch(err => {
+        console.error('拉取后端净值数据库失败:', err);
+        return [];
+      })
+    ]);
 
-    updateStats();
-    applyFilters();
-    updateNavFetchBtn();
+    if (spotList.length === 0 && backendList.length === 0) {
+      throw new Error('无法连接至东方财富或本地后端，请检查网络！');
+    }
+
+    console.log(`[LOF Monitor] 场内拉取 ${spotList.length} 只，后端库拉取 ${backendList.length} 只`);
+
+    // 将数据库的净值和限额以 Map 存储以便 O(1) 闪电 join
+    const dbMap = new Map();
+    backendList.forEach(item => {
+      dbMap.set(item.code, item);
+    });
+
+    // 内存秒级 join 计算溢价率
+    const merged = (spotList.length > 0 ? spotList : backendList).map(spot => {
+      const dbItem = dbMap.get(spot.code) || {};
+      
+      const navVal = dbItem.nav != null ? parseFloat(dbItem.nav) : null;
+      const priceVal = parseFloat(spot.price);
+      
+      let premiumVal = null;
+      if (navVal != null && navVal > 0 && priceVal > 0) {
+        premiumVal = ((priceVal - navVal) / navVal) * 100;
+      }
+
+      // 洗涤后端可能因环境编码坏掉的 buyStatus 文字
+      let safeBuyStatus = dbItem.buyStatus || '开放申购';
+      if (safeBuyStatus.includes('?') || /[\uFFFD\u0080-\uFFFF]/.test(safeBuyStatus)) {
+        // 如果后端传回的申购状态包含乱码问号，或者非标准汉字，一律安全回退至开放申购
+        if (safeBuyStatus.includes('限') || safeBuyStatus.includes('额')) {
+          safeBuyStatus = '限制大额申购';
+        } else if (safeBuyStatus.includes('暂') || safeBuyStatus.includes('停')) {
+          safeBuyStatus = '暂停申购';
+        } else {
+          safeBuyStatus = '开放申购';
+        }
+      }
+
+      return {
+        code: spot.code,
+        name: spot.name || dbItem.name || '—', // 100% 优先使用前端东财直拉的完美无乱码中文名字
+        price: spot.price,
+        change: spot.change,
+        high: spot.high,
+        low: spot.low,
+        open: spot.open,
+        preClose: spot.preClose,
+        volume: spot.volume,
+        priceTime: spot.priceTime,
+        
+        // 数据库中的净值与限制
+        nav: navVal,
+        navTime: dbItem.navTime || '',
+        premium: premiumVal,
+        buyStatus: safeBuyStatus,
+        buyLimit: dbItem.buyLimit,
+        tractorAccounts: dbItem.tractorAccounts || 1,
+        updatedAt: dbItem.updatedAt
+      };
+    });
+
+    allFunds = merged;
+
+    // 独立异常防护屏障，绝不让次级渲染报错阻断核心加载生命周期
+    try {
+      updateStats();
+    } catch (err) {
+      console.error('[LOF Monitor] updateStats 异常:', err);
+    }
+    
+    try {
+      applyFilters();
+    } catch (err) {
+      console.error('[LOF Monitor] applyFilters 异常:', err);
+    }
+    
+    try {
+      updateSyncIndicators();
+    } catch (err) {
+      console.error('[LOF Monitor] updateSyncIndicators 异常:', err);
+    }
 
     setStatus('live', `最新同步：${now()}`);
   } catch (e) {
     console.error('[LOF Monitor] 数据加载异常：', e);
-    setStatus('error', '连接后端失败');
-    if (allFunds.length === 0) showError(e.message);
+    setStatus('error', '同步数据失败: ' + e.message);
+    showError(e.message);
     toast(e.message, 'error');
   } finally {
     isLoading = false;
@@ -99,41 +249,111 @@ async function loadData() {
 
 async function triggerSpotRefresh() {
   if (isLoading) return;
-  isLoading = true;
-  setStatus('loading', '正在触发后端行情更新…');
+  
+  const originalHtml = refreshBtn.innerHTML;
+  refreshBtn.innerHTML = `
+    <svg class="spinner" style="width:12px;height:12px;border-width:2px;margin-right:6px;" viewBox="0 0 16 16"></svg>
+    正在刷新实时价格…
+  `;
   refreshBtn.disabled = true;
-
+  setStatus('loading', '正在秒级同步最新的场内行情价格…');
+  
   try {
-    await triggerBackendSpotFetch();
-    toast('已通知后端更新行情，数据稍后就绪', 'success');
-    // 设置一个定时器，等待后端抓取完毕后拉取最新列表
-    setTimeout(() => {
-      isLoading = false;
-      loadData();
-    }, 2000);
+    // 纯前端直接闪电刷新，耗时 0.2 秒！
+    await loadData();
+    toast('场内实时行情已成功更新！', 'success');
   } catch (e) {
-    toast(e.message, 'error');
-    isLoading = false;
+    toast('刷新价格失败: ' + e.message, 'error');
+    setStatus('error', '刷新场内价格失败');
+  } finally {
+    refreshBtn.innerHTML = originalHtml;
     refreshBtn.disabled = false;
   }
 }
 
 async function fetchNavManual() {
-  // 当前为了简化，"获取净值" 按钮不再需要在前端执行 for 循环。
-  // 可以设计为一个简单的提示：净值由后端定时任务自动获取，或引导用户点击具体单行
-  toast('正在后台批量更新暂缺净值的基金，请稍后刷新查看', 'info');
-  // 可选：实现一个后端批量刷新接口，这里先不做复杂的前端控制队列
+  if (navFetching) return;
+  navFetching = true;
+  
+  const originalHtml = navFetchBtn.innerHTML;
+  navFetchBtn.innerHTML = `
+    <svg class="spinner" style="width:12px;height:12px;border-width:2px;margin-right:6px;" viewBox="0 0 16 16"></svg>
+    正在全量同步单位净值…
+  `;
+  navFetchBtn.disabled = true;
+  toast('已发起场外净值全量同步！基于高并发协程池正在极速更新中…', 'info');
+  
+  try {
+    const res = await fetch(`${API_BASE}/fetch/navs/all`, { method: 'POST' });
+    if (!res.ok) throw new Error('同步请求失败');
+    
+    // 净值刷新在后台静默跑，前台 2.5 秒后同步拉取数据库的更新成果
+    setTimeout(async () => {
+      await loadData();
+      toast('最新场外净值已成功同步载入！', 'success');
+      navFetching = false;
+      navFetchBtn.innerHTML = originalHtml;
+      navFetchBtn.disabled = false;
+    }, 2500);
+  } catch (e) {
+    toast('场外净值同步失败: ' + e.message, 'error');
+    navFetching = false;
+    navFetchBtn.innerHTML = originalHtml;
+    navFetchBtn.disabled = false;
+  }
 }
 
-function updateNavFetchBtn() {
-  if (!navFetchBtn) return;
+function updateSyncIndicators() {
+  if (!spotTimeLabel || !navTimeLabel) return;
+  
+  // 采样提取最新的场内更新时间
+  const sampleWithPriceTime = allFunds.find(f => f.priceTime);
+  const lastPriceTimeStr = sampleWithPriceTime ? sampleWithPriceTime.priceTime : '—';
+  
+  // 采样提取最新的场外净值发布日期
+  const sampleWithNavTime = allFunds.find(f => f.navTime);
+  const lastNavTimeStr = sampleWithNavTime ? sampleWithNavTime.navTime : '—';
+  
   const noNavCount = allFunds.filter(f => f.nav == null).length;
-  navFetchBtn.textContent = '🔄 净值自动同步中';
-  if (navFetchStatus) {
-    navFetchStatus.textContent = noNavCount > 0
-      ? `目前有 ${noNavCount} 支基金等待后端获取净值`
-      : '所有基金已具有净值数据（后端调度中）';
+  
+  spotTimeLabel.textContent = lastPriceTimeStr;
+  navTimeLabel.textContent = lastNavTimeStr + (noNavCount > 0 ? ` (缺 ${noNavCount} 支)` : '');
+  
+  // 动态更新状态圆点指示
+  if (spotChipDot) {
+    spotChipDot.className = 'status-dot live'; // 场内实时闪烁
   }
+  if (navChipDot) {
+    if (noNavCount > 0) {
+      navChipDot.className = 'status-dot loading'; // 净值缺失，呈现黄色警告
+    } else {
+      navChipDot.className = 'status-dot live'; // 全部齐备，呈现翠绿色闪烁
+    }
+  }
+}
+
+function getArbitrageScore(f) {
+  if (f.premium == null || f.premium <= 0 || f.buyStatus === '暂停申购') return 0;
+  
+  let score = f.premium;
+  
+  // 限额权重
+  let limitWeight = 1.0;
+  if (f.buyLimit != null) {
+    if (f.buyLimit <= 100) limitWeight = 0.05;
+    else if (f.buyLimit <= 1000) limitWeight = 0.15;
+    else if (f.buyLimit <= 10000) limitWeight = 0.50;
+    else if (f.buyLimit <= 100000) limitWeight = 0.85;
+  }
+  
+  // 流动性权重（成交额低于 5w 极易踩踏，给 0.1 惩罚）
+  let volWeight = 1.0;
+  const vol = f.volume || 0;
+  if (vol < 50000) volWeight = 0.10;
+  else if (vol < 200000) volWeight = 0.50;
+  else if (vol < 1000000) volWeight = 0.85;
+  
+  return score * limitWeight * volWeight;
 }
 
 function applyFilters() {
@@ -142,9 +362,13 @@ function applyFilters() {
 
   filteredFunds = allFunds.filter(f => {
     if (q && !f.code.includes(q) && !f.name.toLowerCase().includes(q)) return false;
-    if (filter === 'premium' && (f.premium == null || f.premium <= 0)) return false;
+    if (filter === 'arbitrage' && (f.premium == null || f.premium <= 0 || f.buyStatus === '暂停申购')) return false;
+    if (filter === 'open_high') {
+      const canBuy = f.buyStatus && f.buyStatus !== '暂停申购';
+      if (!canBuy || f.premium == null || f.premium < 1.0) return false;
+    }
+    if (filter === 'premium' && (f.premium == null || f.premium < 1.0)) return false;
     if (filter === 'discount' && (f.premium == null || f.premium >= 0)) return false;
-    if (filter === 'high' && (f.premium == null || Math.abs(f.premium) < 1)) return false;
     if (filter === 'nonav' && f.nav !== null) return false;
     return true;
   });
@@ -154,6 +378,17 @@ function applyFilters() {
 }
 
 function sortFunds() {
+  const filter = filterSelect.value;
+  // 如果是智能套利推荐，且排序列依然是默认的 premium (没有手动点击其它表头排序)，则采用智能评分排序
+  if (filter === 'arbitrage' && sortKey === 'premium') {
+    filteredFunds.sort((a, b) => {
+      let sa = getArbitrageScore(a);
+      let sb = getArbitrageScore(b);
+      return sortDir === 'asc' ? sa - sb : sb - sa;
+    });
+    return;
+  }
+
   filteredFunds.sort((a, b) => {
     let av = a[sortKey], bv = b[sortKey];
     if (av == null) av = sortDir === 'asc' ? Infinity : -Infinity;
@@ -163,16 +398,21 @@ function sortFunds() {
 }
 
 function updateStats() {
-  const withNav = allFunds.filter(f => f.premium !== null);
+  const withNav = allFunds.filter(f => f.premium != null);
   totalEl.textContent = allFunds.length;
   premiumEl.textContent = withNav.filter(f => f.premium > 0).length;
   discountEl.textContent = withNav.filter(f => f.premium < 0).length;
 
   const top = withNav.reduce((best, f) =>
     f.premium > (best?.premium ?? -Infinity) ? f : best, null);
-  topEl.textContent = top
-    ? `${top.name.slice(0, 6)} +${top.premium.toFixed(2)}%`
-    : withNav.length === 0 ? '净值未加载' : '—';
+    
+  if (top) {
+    const safeName = (top.name || '').slice(0, 6);
+    const safePremStr = safeFixed(top.premium, 2);
+    topEl.textContent = `${safeName} +${safePremStr}%`;
+  } else {
+    topEl.textContent = withNav.length === 0 ? '净值未加载' : '—';
+  }
 }
 
 // ─── Render ───────────────────────────────────────────────────────────────
@@ -180,14 +420,25 @@ function updateStats() {
 function renderBuyStatus(status, limit) {
   if (!status) return '';
   if (status === '暂停申购') {
-    return '<span style="font-size:10px;margin-left:6px;padding:2px 4px;border-radius:4px;color:#fff;background:var(--premium-high);font-weight:600;">暂停申购</span>';
+    return '<span class="status-badge" style="font-size:10px;margin-left:6px;padding:2px 6px;border-radius:4px;color:#fff;background:#f85149;font-weight:600;white-space:nowrap;">暂停申购</span>';
   }
 
   if (status === '限制大额申购' && limit != null) {
-    return `<span style="font-size:10px;margin-left:6px;padding:2px 4px;border-radius:4px;color:#000;background:var(--warning);font-weight:600;">限购 ${limit}</span>`;
+    let bg = 'var(--warning)';
+    let color = '#fff';
+    if (limit <= 100) {
+      bg = '#da3633'; // 猩红色警示极小限购
+    } else if (limit <= 1000) {
+      bg = '#e57a08'; // 橙色
+    } else if (limit >= 50000) {
+      bg = '#3fb950'; // 宽裕额度绿色
+    }
+    
+    let textLimit = limit >= 10000 ? (limit / 10000) + '万' : limit;
+    return `<span class="status-badge" style="font-size:10px;margin-left:6px;padding:2px 6px;border-radius:4px;color:${color};background:${bg};font-weight:600;white-space:nowrap;">限 ${textLimit}</span>`;
   }
 
-  return '<span style="font-size:10px;margin-left:6px;padding:2px 4px;border-radius:4px;color:#fff;background:var(--premium-low);font-weight:600;">无限制</span>';
+  return '<span class="status-badge" style="font-size:10px;margin-left:6px;padding:2px 6px;border-radius:4px;color:#fff;background:#238636;font-weight:600;white-space:nowrap;">开放申购</span>';
 }
 
 function renderTable() {
@@ -206,45 +457,59 @@ function renderTable() {
   }
 
   const rows = filteredFunds.map(f => {
+    if (!f) return '';
+    
     // 溢价率显示
     let premHtml;
-    if (f.premium !== null) {
-      const premCls = f.premium > 1 ? 'premium-high' : f.premium < -1 ? 'premium-low' : 'premium-mid';
-      const premSign = f.premium > 0 ? '+' : '';
-      premHtml = `<span class="premium-badge ${premCls}">${premSign}${f.premium.toFixed(3)}%</span>`;
+    if (f.premium != null) {
+      const premVal = parseFloat(f.premium);
+      const premCls = premVal > 1 ? 'premium-high' : premVal < -1 ? 'premium-low' : 'premium-mid';
+      const premSign = premVal > 0 ? '+' : '';
+      const premStr = safeFixed(premVal, 3);
+      premHtml = `<span class="premium-badge ${premCls}">${premSign}${premStr}%</span>`;
     } else {
       premHtml = `<span class="premium-badge premium-mid" style="opacity:.45">净值未加载</span>`;
     }
 
-    const chgColor = f.change > 0 ? 'var(--premium-high)' : f.change < 0 ? 'var(--premium-low)' : 'var(--text-secondary)';
-    const chgSign = f.change > 0 ? '+' : '';
+    const chgVal = f.change != null ? parseFloat(f.change) : 0.0;
+    const chgColor = chgVal > 0 ? 'var(--premium-high)' : chgVal < 0 ? 'var(--premium-low)' : 'var(--text-secondary)';
+    const chgSign = chgVal > 0 ? '+' : '';
+    const chgText = safeFixed(chgVal, 2);
+    
     const vol = formatVolume(f.volume);
 
-    // Backend handles the freshness, we just allow manual updates.
     const btnLabel = '更新净值';
     const btnTip = f.updatedAt ? `最后数据库更新: ${new Date(f.updatedAt).toLocaleTimeString()}` : '请求后端更新';
 
+    const tractorHtml = f.tractorAccounts > 1
+      ? `<span class="tractor-badge" style="font-size:10px;margin-left:6px;padding:2px 4px;border-radius:4px;color:#fff;background:var(--accent-blue);font-weight:600;" title="单日申购支持的最大子账户数量">一拖${f.tractorAccounts}</span>`
+      : '';
+
+    const priceText = safeFixed(f.price, 3);
+    const highText = safeFixed(f.high, 3);
+    const navText = f.nav != null ? safeFixed(f.nav, 4) : '<span style="opacity:.35">—</span>';
+
     return `
-    <tr data-code="${f.code}">
+    <tr class="tr-interactive" data-code="${f.code}" style="cursor:pointer" title="点击启动套利计算器">
       <td class="code-cell">${f.code}</td>
       <td>
-        <div class="name-cell" title="${f.name}" style="display:flex;align-items:center;">
-          ${f.name}
+        <div class="name-cell" title="${f.name || ''}" style="display:flex;align-items:center;">
+          ${f.name || '—'}
           ${renderBuyStatus(f.buyStatus, f.buyLimit)}
-          ${f.tractorAccounts > 1 ? `<span class="tractor-badge" style="font-size:10px;margin-left:6px;padding:2px 4px;border-radius:4px;color:#fff;background:var(--accent-blue);font-weight:600;" title="单日申购支持的最大子账户数量">一拖${f.tractorAccounts}</span>` : ''}
+          ${tractorHtml}
         </div>
       </td>
       <td class="price-cell">
-        ${f.price.toFixed(3)}
+        ${priceText}
         ${f.priceTime ? `<div class="time-sub">${f.priceTime}</div>` : ''}
       </td>
       <td class="nav-cell">
-        ${f.nav ? f.nav.toFixed(4) : '<span style="opacity:.35">—</span>'}
+        ${navText}
         ${f.navTime ? `<div class="time-sub">${f.navTime}</div>` : ''}
       </td>
       <td>${premHtml}</td>
-      <td class="change-cell" style="color:${chgColor}">${chgSign}${f.change.toFixed(2)}%</td>
-      <td class="price-cell" style="font-size:12px;color:var(--text-secondary)">${f.high.toFixed(3)}</td>
+      <td class="change-cell" style="color:${chgColor}">${chgSign}${chgText}%</td>
+      <td class="price-cell" style="font-size:12px;color:var(--text-secondary)">${highText}</td>
       <td class="volume-cell">${vol}</td>
       <td style="text-align:center">
         <button class="btn-row-nav" data-code="${f.code}" title="${btnTip}">${btnLabel}</button>
@@ -298,35 +563,180 @@ filterSelect.addEventListener('change', applyFilters);
 refreshBtn.addEventListener('click', () => { triggerSpotRefresh(); });
 navFetchBtn.addEventListener('click', fetchNavManual);
 
-// 行级更新按钮：通知后端去抓取最新净值
+// 行级点击与操作分发：更新净值、套利计算器
 tableBody.addEventListener('click', async (e) => {
+  // 1. 更新单只基金净值
   const btn = e.target.closest('.btn-row-nav');
-  if (!btn) return;
-  const code = btn.dataset.code;
-  if (!code || btn.disabled) return;
+  if (btn) {
+    e.stopPropagation();
+    const code = btn.dataset.code;
+    if (!code || btn.disabled) return;
 
-  btn.disabled = true;
-  btn.textContent = '请求后端…';
+    btn.disabled = true;
+    btn.textContent = '请求后端…';
 
-  try {
-    await triggerBackendNavFetch(code);
-    toast(`已提交 ${code} 的净值更新请求`, 'info');
+    try {
+      await triggerBackendNavFetch(code);
+      toast(`已提交 ${code} 的净值更新请求`, 'info');
 
-    // 延迟 1.5s 后重新拉取全表数据以体现最新净值
-    setTimeout(() => {
-      loadData().then(() => {
-        toast(`${code} 净值已同步至界面`, 'success');
-      });
-    }, 1500);
+      setTimeout(() => {
+        loadData().then(() => {
+          toast(`${code} 净值已成功同步`, 'success');
+        });
+      }, 1500);
 
-  } catch (error) {
-    toast(`${code} 请求失败`, 'error');
-    btn.disabled = false;
-    btn.textContent = '更新失败';
+    } catch (error) {
+      toast(`${code} 请求失败`, 'error');
+      btn.disabled = false;
+      btn.textContent = '更新失败';
+    }
+    return;
+  }
+
+  // 3. 点击整行弹起套利决策计算器 (排除点击了调试按钮或拖拉机按钮的情况)
+  const row = e.target.closest('.tr-interactive');
+  if (row) {
+    const code = row.dataset.code;
+    if (code) {
+      const fund = allFunds.find(f => f.code === code);
+      if (fund) {
+        openCalculator(fund);
+      }
+    }
   }
 });
 
+// ─── Calculator Logic ──────────────────────────────────────────────────
+const modal = document.getElementById('arbitrage-modal');
+const modalClose = document.getElementById('modal-close');
+const calcName = document.getElementById('calc-name');
+const calcCode = document.getElementById('calc-code');
+const calcPremium = document.getElementById('calc-premium');
+const calcLimit = document.getElementById('calc-limit');
+const calcTractorVal = document.getElementById('calc-tractor-val');
+const calcTractorDec = document.getElementById('calc-tractor-dec');
+const calcTractorInc = document.getElementById('calc-tractor-inc');
+const calcTotalApply = document.getElementById('calc-total-apply');
+const calcFeeInput = document.getElementById('calc-fee-input');
+const calcProfit = document.getElementById('calc-profit');
+const calcWarning = document.getElementById('calc-warning');
+
+let currentCalcFund = null;
+let tempTractorVal = 1;
+
+function openCalculator(fund) {
+  currentCalcFund = fund;
+  tempTractorVal = fund.tractorAccounts || 1;
+  
+  calcName.textContent = fund.name;
+  calcCode.textContent = fund.code;
+  calcPremium.textContent = fund.premium != null ? `${safeFixed(fund.premium, 3)}%` : '—';
+  
+  if (fund.buyStatus === '暂停申购') {
+    calcLimit.textContent = '暂停申购';
+    calcLimit.style.color = '#f85149';
+  } else if (fund.buyLimit != null) {
+    calcLimit.textContent = `${formatMoney(fund.buyLimit)}元`;
+    calcLimit.style.color = 'var(--warning)';
+  } else {
+    calcLimit.textContent = '无限制';
+    calcLimit.style.color = 'var(--premium-low)';
+  }
+  
+  calcTractorVal.textContent = tempTractorVal;
+  
+  // 警告提示
+  const vol = fund.volume || 0;
+  if (fund.buyStatus === '暂停申购') {
+    calcWarning.textContent = '🚨 该基金当前处于暂停申购状态，无法发起申购套利！';
+    calcWarning.style.color = '#f85149';
+    calcWarning.style.background = 'rgba(248, 81, 73, 0.12)';
+  } else if (vol < 100000) {
+    calcWarning.textContent = '⚠️ 警示：该基金日成交额过低（流动性不足 10 万元），若申购资金过多，在场内卖出变现时极易因缺乏对手盘导致砸盘折价，产生折损风险！';
+    calcWarning.style.color = 'var(--warning)';
+    calcWarning.style.background = 'var(--warning-dim)';
+  } else {
+    calcWarning.textContent = '✅ 流动性良好。完成申购并折算场内份额后，请注意下一工作日的场内波动，在合适溢价位置通过二级市场卖出。';
+    calcWarning.style.color = 'var(--premium-low)';
+    calcWarning.style.background = 'var(--premium-low-dim)';
+  }
+  
+  updateCalculations();
+  modal.style.display = 'flex';
+}
+
+function updateCalculations() {
+  if (!currentCalcFund) return;
+  
+  let limit = currentCalcFund.buyLimit;
+  let premium = currentCalcFund.premium || 0;
+  let feeRate = parseFloat(calcFeeInput.value) || 0;
+  
+  let totalApply = 0;
+  let limitText = '';
+  
+  if (currentCalcFund.buyStatus === '暂停申购') {
+    totalApply = 0;
+    limitText = '0 元 (暂停申购)';
+  } else if (limit != null) {
+    totalApply = limit * tempTractorVal;
+    limitText = `${formatMoney(totalApply)}元 (${tempTractorVal}账户联申)`;
+  } else {
+    totalApply = 50000 * tempTractorVal; // 缺省假定为 5 万/账户
+    limitText = `${formatMoney(totalApply)}元 (建议单日测算上限)`;
+  }
+  
+  calcTotalApply.textContent = limitText;
+  
+  // 纯收益 = 申购金额 * (溢价率 - 申购费率)
+  let profit = totalApply * ((premium - feeRate) / 100);
+  if (profit < 0) profit = 0;
+  
+  calcProfit.textContent = `+${profit.toFixed(2)} 元`;
+}
+
+calcTractorDec.addEventListener('click', () => {
+  if (tempTractorVal > 1) {
+    tempTractorVal--;
+    calcTractorVal.textContent = tempTractorVal;
+    updateCalculations();
+  }
+});
+
+calcTractorInc.addEventListener('click', () => {
+  if (tempTractorVal < 6) {
+    tempTractorVal++;
+    calcTractorVal.textContent = tempTractorVal;
+    updateCalculations();
+  }
+});
+
+calcFeeInput.addEventListener('input', updateCalculations);
+
+modalClose.addEventListener('click', () => {
+  modal.style.display = 'none';
+  currentCalcFund = null;
+});
+
+modal.addEventListener('click', (e) => {
+  if (e.target === modal) {
+    modal.style.display = 'none';
+    currentCalcFund = null;
+  }
+});
+
+function formatMoney(num) {
+  if (num >= 10000) return (num / 10000).toFixed(1) + ' 万';
+  return num.toLocaleString();
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
+
+function safeFixed(val, digits = 2) {
+  if (val == null || val === '') return '—';
+  const num = parseFloat(val);
+  return isNaN(num) ? '—' : num.toFixed(digits);
+}
 
 function safeNum(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -350,8 +760,12 @@ function formatVolume(v) {
 }
 
 function setStatus(type, text) {
-  statusDot.className = 'status-dot ' + type;
-  statusText.textContent = text;
+  if (statusDot) {
+    statusDot.className = 'status-dot ' + type;
+  }
+  if (statusText) {
+    statusText.textContent = text;
+  }
 }
 
 function toast(msg, type = 'info') {

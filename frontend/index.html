@@ -20,26 +20,35 @@
         <p class="subtitle">实时追踪一级市场净值与二级市场场内价格的溢价率</p>
       </div>
       <div class="header-right">
-        <div class="status-bar">
-          <span id="status-dot" class="status-dot"></span>
-          <span id="status-text">初始化中…</span>
+        <!-- ── 专业双源微型状态提示灯 ── -->
+        <div class="sync-indicators-bar" style="display:flex;gap:8px;margin-right:12px;flex-wrap:wrap">
+          <span class="indicator-chip" title="二级市场场内价格最后拉取同步的时间">
+            <span id="spot-chip-dot" class="status-dot live"></span>
+            场内实时价: <strong id="spot-time-label" style="color:var(--accent-blue)">正在载入…</strong>
+          </span>
+          <span class="indicator-chip" title="一级市场单位净值最新数据发布日期及缺漏情况">
+            <span id="nav-chip-dot" class="status-dot"></span>
+            场外净值表: <strong id="nav-time-label" style="color:var(--text-secondary)">正在载入…</strong>
+          </span>
         </div>
-        <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end">
-          <div style="display:flex;gap:8px">
-            <button id="refresh-btn" class="btn btn-primary">
-              <svg viewBox="0 0 16 16" fill="currentColor">
-                <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z" />
-                <path
-                  d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z" />
-              </svg>
-              立即刷新
-            </button>
-            <button id="nav-fetch-btn" class="btn">
-              💹 获取净值
-            </button>
-          </div>
-          <span id="nav-fetch-status"
-            style="font-size:11px;color:var(--text-muted);text-align:right">净值未加载，点击手动获取</span>
+        
+        <!-- ── 专业二分操作按钮 ── -->
+        <div style="display:flex;gap:8px">
+          <button id="refresh-btn" class="btn btn-primary" title="用于刷新盘中最新的交易价格、成交额与涨跌幅 (支持每秒快速刷新)">
+            <svg viewBox="0 0 16 16" fill="currentColor">
+              <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z" />
+              <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z" />
+            </svg>
+            ⚡ 刷新场内价格 (二级)
+          </button>
+          
+          <button id="nav-fetch-btn" class="btn" title="基于后台 Semaphore 协程池，极速全量拉取并同步今日最新的单位净值与申购额限制">
+            <svg viewBox="0 0 16 16" fill="currentColor">
+              <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z" />
+              <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z" />
+            </svg>
+            🔄 同步单位净值 (一级)
+          </button>
         </div>
       </div>
     </header>
@@ -83,9 +92,10 @@
         <span>筛选</span>
         <select id="filter-select">
           <option value="all">全部</option>
-          <option value="premium">仅溢价</option>
+          <option value="arbitrage">💎 智能套利推荐</option>
+          <option value="open_high" selected>🎯 开放申购+显著溢价(≥1%)</option>
+          <option value="premium">仅显著溢价(≥1%)</option>
           <option value="discount">仅折价</option>
-          <option value="high">显著偏差（≥1%）</option>
           <option value="nonav">净值未加载</option>
         </select>
       </div>
@@ -136,10 +146,71 @@
 
   </div>
 
+  <!-- ── 套利计算器 Modal ──────────────────────────────── -->
+  <div id="arbitrage-modal" class="modal-overlay" style="display:none">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>🚜 套利深度决策助手</h2>
+        <button id="modal-close" class="modal-close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="calc-section">
+          <div class="calc-row">
+            <span class="calc-label">基金名称</span>
+            <span id="calc-name" class="calc-value-highlight">—</span>
+          </div>
+          <div class="calc-row">
+            <span class="calc-label">基金代码</span>
+            <span id="calc-code" class="calc-value-mono">—</span>
+          </div>
+          <div class="calc-row">
+            <span class="calc-label">当前溢价率</span>
+            <span id="calc-premium" class="calc-value-highlight">—</span>
+          </div>
+          <div class="calc-row">
+            <span class="calc-label">单日限制申购额</span>
+            <span id="calc-limit" class="calc-value-mono">—</span>
+          </div>
+          <hr class="calc-divider" />
+          <div class="calc-row">
+            <span class="calc-label">拖拉机联申账户数</span>
+            <div class="calc-count-control">
+              <button id="calc-tractor-dec" class="calc-btn">-</button>
+              <span id="calc-tractor-val" class="calc-value-highlight">1</span>
+              <button id="calc-tractor-inc" class="calc-btn">+</button>
+            </div>
+          </div>
+          <div class="calc-row">
+            <span class="calc-label">单人最大申购上限</span>
+            <span id="calc-total-apply" class="calc-value-mono" style="color:var(--accent-blue);font-weight:700">—</span>
+          </div>
+          <div class="calc-row">
+            <span class="calc-label">预估申购费率 (%)</span>
+            <input id="calc-fee-input" type="number" class="calc-input" value="0.10" step="0.01" min="0" max="5" />
+          </div>
+          <hr class="calc-divider" />
+          <div class="calc-row calc-result-row">
+            <span class="calc-label">💰 单日预期套利纯收益</span>
+            <span id="calc-profit" class="calc-value-highlight" style="color:var(--premium-high);font-size:20px">—</span>
+          </div>
+          <div id="calc-warning" class="calc-warning-box">
+            ⚠️ 友情提示：日成交额过低，大额赎回时可能存在场内折价踩踏风险，请注意流动性安全。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Toast container ──────────────────────────────── -->
   <div id="toast-container" class="toast-container"></div>
 
-  <script src="app.js"></script>
+  <!-- 兼容性双兜底隐藏 DOM 结构 -->
+  <div style="display:none">
+    <span id="status-dot"></span>
+    <span id="status-text"></span>
+  </div>
+
+  <script src="app.js?v=20260601_1545"></script>
 </body>
 
 </html>

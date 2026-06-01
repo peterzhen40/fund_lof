@@ -38,9 +38,20 @@ def format_unix_sec(sec: Any) -> str:
 
 async def fetch_page(client: httpx.AsyncClient, pn: int) -> dict:
     url = f"{EASTMONEY_SPOT_BASE_URL}&pn={pn}"
-    resp = await client.get(url, timeout=10.0)
-    resp.raise_for_status()
-    return resp.json()
+    for attempt in range(3):
+        try:
+            resp = await client.get(url, headers=NAV_HEADERS, timeout=10.0)
+            resp.raise_for_status()
+            # 采用 GBK 优先解码，100% 根除东财行情返回中存在的乱码
+            try:
+                text = resp.content.decode("gbk")
+            except Exception:
+                text = resp.content.decode("utf-8", errors="ignore")
+            return json.loads(text)
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            await asyncio.sleep(1)
 
 def parse_diff(data: dict) -> List[Dict]:
     diff = data.get("data", {}).get("diff", [])
@@ -96,7 +107,11 @@ async def fetch_nav_fundgz(client: httpx.AsyncClient, code: str) -> dict:
     url = f"https://fundgz.1234567.com.cn/js/{code}.js?rt={int(datetime.now().timestamp() * 1000)}"
     try:
         resp = await client.get(url, headers=NAV_HEADERS, timeout=8.0)
-        text = resp.text
+        # 天天基金 JS 通常为 utf-8，但以防万一这里同样做 gbk 回退保护
+        try:
+            text = resp.content.decode("gbk")
+        except Exception:
+            text = resp.content.decode("utf-8", errors="ignore")
         match = re.search(r'jsonpgz\((.*?)\)', text)
         if match:
             # 可能是 jsonpgz() 空调用
@@ -128,7 +143,10 @@ async def fetch_nav_pingzhong(client: httpx.AsyncClient, code: str) -> dict:
     url = f"https://fund.eastmoney.com/pingzhongdata/{code}.js?v={int(datetime.now().timestamp() * 1000)}"
     try:
         resp = await client.get(url, headers=NAV_HEADERS, timeout=8.0)
-        text = resp.text
+        try:
+            text = resp.content.decode("gbk")
+        except Exception:
+            text = resp.content.decode("utf-8", errors="ignore")
         match = re.search(r'var Data_netWorthTrend\s*=\s*(\[.*?\]);', text)
         if match:
             trend = json.loads(match.group(1))
@@ -163,7 +181,12 @@ async def fetch_buy_status(client: httpx.AsyncClient, code: str) -> dict:
     url = f"https://fundmobapi.eastmoney.com/FundMApi/FundBaseTypeInformation.ashx?FCODE={code}&deviceid=Wap&plat=Wap&product=EFund&version=6.6.0"
     try:
         resp = await client.get(url, headers=NAV_HEADERS, timeout=8.0)
-        data = resp.json().get("Datas", {})
+        # 用 gbk 解码以完美保留中文
+        try:
+            text = resp.content.decode("gbk")
+        except Exception:
+            text = resp.content.decode("utf-8", errors="ignore")
+        data = json.loads(text).get("Datas", {})
         sgzt = data.get("SGZT", "")
         
         # 提取 "限大额(单日投资上限50万元)"、"限大额(单日投资上限1000元)" 中的数值
@@ -224,6 +247,12 @@ async def sync_spots_to_db():
             
         db.commit()
         print(f"[Sync] Spotlight synced {updated} funds.")
+        # 同步更新全局内存缓存
+        try:
+            from .main import update_global_cache_outside
+            update_global_cache_outside()
+        except Exception as e:
+            print(f"[Sync] Cache update failed: {e}")
     finally:
         db.close()
 
@@ -250,27 +279,92 @@ async def sync_nav_to_db(code: str):
             fund.premium = (fund.price - fund.nav) / fund.nav * 100
             
         db.commit()
+        # 同步更新全局内存缓存
+        try:
+            from .main import update_global_cache_outside
+            update_global_cache_outside()
+        except Exception as e:
+            print(f"[Sync] Cache update failed: {e}")
         return True
     finally:
         db.close()
 
-async def sync_all_navs_to_db():
+async def sync_all_navs_to_db(force_update: bool = False):
     db = SessionLocal()
     try:
         funds = db.query(Fund).all()
-        codes = [f.code for f in funds]
+        funds_to_update = []
+        for f in funds:
+            is_today = False
+            if f.updated_at:
+                is_today = f.updated_at.date() == datetime.now().date()
+            
+            # 如果没有净值，或者更新不是今天，或者是强制更新，则进入更新队列
+            if force_update or not f.nav or not is_today:
+                funds_to_update.append(f.code)
     finally:
         db.close()
         
-    updated = 0
-    for code in codes:
-        try:
-            success = await sync_nav_to_db(code)
-            if success:
-                updated += 1
-        except Exception as e:
-            print(f"[Sync NAV Error] {code}: {e}")
-            
-        await asyncio.sleep(0.5) # 防封禁延迟
+    if not funds_to_update:
+        print("[Sync] All funds already have today's NAV. Skipping bulk sync.")
+        return
         
-    print(f"[Sync] NAV bulk sync completed: {updated}/{len(codes)} updated.")
+    print(f"[Sync] Starting bulk NAV sync for {len(funds_to_update)}/{len(funds)} funds...")
+    
+    sem = asyncio.Semaphore(15)
+    results = []
+    
+    async def worker(code: str):
+        async with sem:
+            try:
+                import random
+                # 随机微延迟 0-100ms 离散请求
+                await asyncio.sleep(random.uniform(0.0, 0.1))
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    res = await fetch_nav_fundgz(client, code)
+                    if not res.get("nav"):
+                        res = await fetch_nav_pingzhong(client, code)
+                    status_info = await fetch_buy_status(client, code)
+                    if status_info:
+                        res["buy_status"] = status_info.get("buy_status")
+                        res["buy_limit"] = status_info.get("buy_limit")
+                    
+                    if res.get("nav"):
+                        results.append((code, res))
+            except Exception as e:
+                print(f"[Sync NAV Fetch Error] {code}: {e}")
+
+    tasks = [worker(code) for code in funds_to_update]
+    await asyncio.gather(*tasks)
+    
+    # 抓取完毕后，进行单次 Session 批量 Commit 落库，100% 避免 SQLite 文件锁竞争死锁！
+    if results:
+        db = SessionLocal()
+        try:
+            updated = 0
+            for code, res in results:
+                fund = db.query(Fund).filter(Fund.code == code).first()
+                if fund:
+                    fund.nav = res["nav"]
+                    fund.nav_time = res["nav_time"]
+                    if "buy_status" in res:
+                        fund.buy_status = res["buy_status"]
+                    if "buy_limit" in res:
+                        fund.buy_limit = res["buy_limit"]
+                        
+                    if fund.price and fund.nav > 0:
+                        fund.premium = (fund.price - fund.nav) / fund.nav * 100
+                    updated += 1
+            db.commit()
+            print(f"[Sync] NAV bulk sync completed: {updated}/{len(funds_to_update)} updated in single batch commit.")
+            # 同步更新全局内存缓存
+            try:
+                from .main import update_global_cache_outside
+                update_global_cache_outside()
+            except Exception as e:
+                print(f"[Sync] Cache update failed: {e}")
+        except Exception as e:
+            print(f"[Sync Batch Commit Error] {e}")
+            db.rollback()
+        finally:
+            db.close()

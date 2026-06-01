@@ -6,7 +6,7 @@ import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from sqlalchemy import text
-from .database import Base, engine, get_db, Fund
+from .database import Base, engine, get_db, Fund, SessionLocal
 from .fetcher import sync_spots_to_db, sync_nav_to_db, sync_all_navs_to_db
 
 app = FastAPI(title="LOF Premium Monitor API")
@@ -18,6 +18,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 全局极速内存缓存，使前台刷新瞬间（0毫秒）秒开，彻底避免 SQLite 读写锁阻塞
+GLOBAL_FUNDS_CACHE = []
+
+def update_global_cache(db: Session):
+    global GLOBAL_FUNDS_CACHE
+    funds = db.query(Fund).order_by(Fund.premium.desc()).all()
+    GLOBAL_FUNDS_CACHE = [
+        {
+            "code": f.code,
+            "name": f.name,
+            "price": f.price,
+            "nav": f.nav,
+            "premium": f.premium,
+            "change": f.change,
+            "high": f.high,
+            "low": f.low,
+            "open": f.open,
+            "preClose": f.pre_close,
+            "volume": f.volume,
+            "priceTime": f.price_time,
+            "navTime": f.nav_time,
+            "buyStatus": f.buy_status,
+            "buyLimit": f.buy_limit,
+            "tractorAccounts": getattr(f, "tractor_max_accounts", 1),
+            "updatedAt": f.updated_at.isoformat() if f.updated_at else None
+        }
+        for f in funds
+    ]
+    print(f"⚡ [Cache] Global memory cache updated with {len(GLOBAL_FUNDS_CACHE)} funds.")
+
+def update_global_cache_outside():
+    db = SessionLocal()
+    try:
+        update_global_cache(db)
+    finally:
+        db.close()
 
 scheduler = AsyncIOScheduler()
 
@@ -62,8 +99,24 @@ async def startup_event():
                 print("Failed to connect to the database after several retries.")
                 raise e
     
-    # 启动时先拉取一次行情
-    asyncio.create_task(sync_spots_to_db())
+    # 启动时立刻填充一遍缓存，保证在后台刷新行情前，前台刷新能有数据瞬间返回
+    update_global_cache_outside()
+    
+    # 启动时加载链：先拉取场内行情(秒级入库，使前台秒开展示)，随后在后台静默增量补全净值
+    async def initial_load_chain():
+        try:
+            await sync_spots_to_db()
+            print("💡 [Startup] Initial spot synced successfully.")
+        except Exception as e:
+            print(f"⚠️ [Startup] Initial spot sync failed: {e}")
+            
+        try:
+            await sync_all_navs_to_db(force_update=False)
+            print("💡 [Startup] Initial NAVs sync completed.")
+        except Exception as e:
+            print(f"⚠️ [Startup] Initial NAVs sync failed: {e}")
+
+    asyncio.create_task(initial_load_chain())
     
     # 定时任务：交易日每 5 分钟刷新一次行情
     scheduler.add_job(sync_spots_to_db, 'cron', day_of_week='mon-fri', hour='9-15', minute='*/5')
@@ -78,33 +131,9 @@ async def shutdown_event():
     scheduler.shutdown()
 
 @app.get("/api/funds")
-def get_funds(db: Session = Depends(get_db)):
-    # MySQL 默认认为 NULL 比任何值都小，因此在 DESC 排序中 NULL 自然会排在最后。
-    # 移除 SQLite 环境专用的 .nulls_last()，避免 MySQL 报错。
-    funds = db.query(Fund).order_by(Fund.premium.desc()).all()
-    # 转换为字典列表
-    return [
-        {
-            "code": f.code,
-            "name": f.name,
-            "price": f.price,
-            "nav": f.nav,
-            "premium": f.premium,
-            "change": f.change,
-            "high": f.high,
-            "low": f.low,
-            "open": f.open,
-            "preClose": f.pre_close,
-            "volume": f.volume,
-            "priceTime": f.price_time,
-            "navTime": f.nav_time,
-            "buyStatus": f.buy_status,
-            "buyLimit": f.buy_limit,
-            "tractorAccounts": getattr(f, "tractor_max_accounts", 1),
-            "updatedAt": f.updated_at.isoformat() if f.updated_at else None
-        }
-        for f in funds
-    ]
+def get_funds():
+    # 彻底告别 SQLite 并发锁，直接从极速全局内存缓存中读取
+    return GLOBAL_FUNDS_CACHE
 
 @app.post("/api/fund/{code}/tractor")
 def toggle_tractor(code: str, db: Session = Depends(get_db)):
@@ -123,6 +152,10 @@ def toggle_tractor(code: str, db: Session = Depends(get_db)):
         
     fund.tractor_max_accounts = next_val
     db.commit()
+    
+    # 更新拖拉机后立刻同步刷入全局内存缓存，前台可无感获取最新状态
+    update_global_cache(db)
+    
     return {"status": "ok", "tractorAccounts": fund.tractor_max_accounts}
 
 @app.post("/api/fetch/spot")
@@ -134,7 +167,7 @@ async def fetch_spot_manual(background_tasks: BackgroundTasks):
 @app.post("/api/fetch/navs/all")
 async def fetch_all_navs_manual(background_tasks: BackgroundTasks):
     # 手动触发刷新全量净值 (Debug)
-    background_tasks.add_task(sync_all_navs_to_db)
+    background_tasks.add_task(sync_all_navs_to_db, force_update=True)
     return {"status": "ok", "message": "All NAVs sync task started in background."}
 
 @app.post("/api/fetch/nav/{code}")
@@ -145,6 +178,24 @@ async def fetch_nav_manual(code: str, background_tasks: BackgroundTasks):
 
 # Mount frontend static files last
 import os
+from fastapi.responses import HTMLResponse
 frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+
+@app.get("/", response_class=HTMLResponse)
+def get_index():
+    index_path = os.path.join(frontend_dir, "index.html")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return HTMLResponse(
+            content=content,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+        )
+    return HTMLResponse(content="<h3>Index not found</h3>", status_code=404)
+
 if os.path.exists(frontend_dir):
     app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
